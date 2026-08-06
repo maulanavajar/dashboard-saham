@@ -152,21 +152,10 @@ def hitung_pivot_point(df: pd.DataFrame) -> dict:
     }
 
 
-def cari_swing_support_resistance(df: pd.DataFrame, window: int = 5, toleransi_persen: float = 1.5) -> dict:
-    """
-    Deteksi level support/resistance berdasarkan titik-titik swing high/low
-    yang paling sering 'disentuh' harga (bukan cuma min/max mentah).
-
-    Cara kerja:
-    1. Cari swing low/high lokal (titik yang lebih rendah/tinggi dari tetangganya).
-    2. Kelompokkan titik-titik yang berdekatan (dalam toleransi %) jadi satu level.
-    3. Level dengan jumlah sentuhan terbanyak = level paling kuat.
-    """
-    recent = df.tail(90).copy()  # 90 hari terakhir cukup untuk swing yang relevan
-
-    # Cari swing low: titik yang lebih rendah dari 'window' hari sebelum & sesudahnya
-    swing_lows = []
-    swing_highs = []
+def _deteksi_level_swing(df: pd.DataFrame, window: int = 5, toleransi_persen: float = 1.5) -> dict:
+    """Fungsi inti deteksi swing support/resistance, return level RAW (angka) + jumlah sentuhan."""
+    recent = df.tail(90).copy()
+    swing_lows, swing_highs = [], []
     lows = recent["Low"].values
     highs = recent["High"].values
 
@@ -177,7 +166,6 @@ def cari_swing_support_resistance(df: pd.DataFrame, window: int = 5, toleransi_p
             swing_highs.append(highs[i])
 
     def kelompokkan_level(titik_titik, toleransi_persen):
-        """Kelompokkan titik yang berdekatan, hitung jumlah sentuhan per kelompok."""
         if not titik_titik:
             return []
         titik_terurut = sorted(titik_titik)
@@ -188,27 +176,82 @@ def cari_swing_support_resistance(df: pd.DataFrame, window: int = 5, toleransi_p
                 kelompok[-1].append(t)
             else:
                 kelompok.append([t])
-        # return list of (level_rata_rata, jumlah_sentuhan), diurutkan dari paling kuat
         hasil = [(round(sum(k) / len(k), 2), len(k)) for k in kelompok]
         return sorted(hasil, key=lambda x: x[1], reverse=True)
 
     level_support = kelompokkan_level(swing_lows, toleransi_persen)
     level_resistance = kelompokkan_level(swing_highs, toleransi_persen)
 
+    return {
+        "support_level": level_support[0][0] if level_support else None,
+        "support_sentuhan": level_support[0][1] if level_support else 0,
+        "resistance_level": level_resistance[0][0] if level_resistance else None,
+        "resistance_sentuhan": level_resistance[0][1] if level_resistance else 0,
+    }
+
+
+def cari_swing_support_resistance(df: pd.DataFrame, window: int = 5, toleransi_persen: float = 1.5) -> dict:
+    """
+    Deteksi level support/resistance berdasarkan titik-titik swing high/low
+    yang paling sering 'disentuh' harga (bukan cuma min/max mentah).
+
+    Cara kerja:
+    1. Cari swing low/high lokal (titik yang lebih rendah/tinggi dari tetangganya).
+    2. Kelompokkan titik-titik yang berdekatan (dalam toleransi %) jadi satu level.
+    3. Level dengan jumlah sentuhan terbanyak = level paling kuat.
+    """
+    raw = _deteksi_level_swing(df, window, toleransi_persen)
+
     hasil = {}
-    if level_support:
-        harga, sentuhan = level_support[0]
-        hasil["Support Terkuat (90 hari)"] = f"{harga} (disentuh {sentuhan}x)"
+    if raw["support_level"] is not None:
+        hasil["Support Terkuat (90 hari)"] = f"{raw['support_level']} (disentuh {raw['support_sentuhan']}x)"
     else:
         hasil["Support Terkuat (90 hari)"] = "-"
 
-    if level_resistance:
-        harga, sentuhan = level_resistance[0]
-        hasil["Resistance Terkuat (90 hari)"] = f"{harga} (disentuh {sentuhan}x)"
+    if raw["resistance_level"] is not None:
+        hasil["Resistance Terkuat (90 hari)"] = f"{raw['resistance_level']} (disentuh {raw['resistance_sentuhan']}x)"
     else:
         hasil["Resistance Terkuat (90 hari)"] = "-"
 
     return hasil
+
+
+def hitung_sl_tp(close: float, support: float, resistance: float, buffer_persen: float = 1.0) -> dict:
+    """
+    Hitung Stop Loss & Take Profit berdasarkan Support/Resistance, dengan buffer,
+    plus Risk-Reward Ratio-nya. Buffer mengantisipasi 'fakeout' (harga sedikit
+    menembus level sebelum benar-benar mantul/gagal mantul).
+    """
+    sl = support * (1 - buffer_persen / 100)
+    tp = resistance * (1 - buffer_persen / 100)  # sedikit di bawah resistance, lebih realistis
+
+    risiko = close - sl
+    potensi_untung = tp - close
+
+    if risiko <= 0 or potensi_untung <= 0:
+        # Harga sudah di luar range Support-Resistance yang wajar
+        return {
+            "SL": round(sl, 2),
+            "TP": round(tp, 2),
+            "Risiko (Rp)": round(risiko, 2),
+            "Potensi Untung (Rp)": round(potensi_untung, 2),
+            "Risk-Reward Ratio": "N/A (harga di luar range S/R)",
+            "valid": False,
+        }
+
+    rr_ratio = potensi_untung / risiko
+
+    return {
+        "SL": round(sl, 2),
+        "TP": round(tp, 2),
+        "Risiko (Rp)": round(risiko, 2),
+        "Risiko (%)": round(risiko / close * 100, 2),
+        "Potensi Untung (Rp)": round(potensi_untung, 2),
+        "Potensi Untung (%)": round(potensi_untung / close * 100, 2),
+        "Risk-Reward Ratio": f"1 : {round(rr_ratio, 2)}",
+        "rr_value": round(rr_ratio, 2),
+        "valid": True,
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)  # cache 1 jam, fundamental jarang berubah
@@ -366,6 +409,59 @@ with tab_detail:
                 st.markdown("**Fundamental Dasar**")
                 for k, v in fundamental.items():
                     st.write(f"{k}: `{v}`")
+
+            st.divider()
+            st.subheader("🎯 Kalkulator Stop Loss / Take Profit")
+            st.caption(
+                "Perhitungan otomatis berdasarkan Support/Resistance. "
+                "Bukan rekomendasi trading — gunakan sebagai salah satu pertimbangan saja."
+            )
+
+            colA, colB = st.columns(2)
+            with colA:
+                sumber_level = st.radio(
+                    "Sumber level Support/Resistance",
+                    ["Pivot Point (harian)", "Support/Resistance Historis (90 hari)"],
+                    key="sumber_sltp",
+                )
+            with colB:
+                buffer = st.slider(
+                    "Buffer (%) — antisipasi fakeout",
+                    min_value=0.0, max_value=5.0, value=1.0, step=0.5,
+                    key="buffer_sltp",
+                )
+
+            raw_swing = _deteksi_level_swing(df)
+
+            if sumber_level == "Pivot Point (harian)":
+                support_dipakai = pivot["Support 1"]
+                resistance_dipakai = pivot["Resistance 1"]
+            else:
+                support_dipakai = raw_swing["support_level"]
+                resistance_dipakai = raw_swing["resistance_level"]
+
+            if support_dipakai is None or resistance_dipakai is None:
+                st.warning("Level Support/Resistance historis belum terdeteksi untuk saham ini, coba pakai Pivot Point.")
+            else:
+                hasil_sltp = hitung_sl_tp(last["Close"], support_dipakai, resistance_dipakai, buffer)
+
+                colC, colD, colE, colF = st.columns(4)
+                colC.metric("Stop Loss", f"Rp {hasil_sltp['SL']:,.2f}")
+                colD.metric("Take Profit", f"Rp {hasil_sltp['TP']:,.2f}")
+
+                if hasil_sltp["valid"]:
+                    colE.metric("Risiko", f"{hasil_sltp['Risiko (%)']}%", delta=f"-Rp{hasil_sltp['Risiko (Rp)']:,.0f}", delta_color="inverse")
+                    colF.metric("Potensi Untung", f"{hasil_sltp['Potensi Untung (%)']}%", delta=f"+Rp{hasil_sltp['Potensi Untung (Rp)']:,.0f}")
+
+                    st.write(f"**Risk-Reward Ratio: `{hasil_sltp['Risk-Reward Ratio']}`**")
+                    if hasil_sltp["rr_value"] >= 2:
+                        st.success("✅ Rasio ≥ 1:2 — secara matematis cukup baik (potensi untung jauh lebih besar dari risiko).")
+                    elif hasil_sltp["rr_value"] >= 1:
+                        st.warning("⚠️ Rasio antara 1:1 - 1:2 — cukup, tapi bukan yang ideal.")
+                    else:
+                        st.error("🚫 Rasio di bawah 1:1 — potensi risiko lebih besar dari potensi untung, pertimbangkan ulang.")
+                else:
+                    st.error(f"⚠️ {hasil_sltp['Risk-Reward Ratio']} — harga saat ini sudah di luar range Support-Resistance yang wajar untuk dihitung.")
 
         except Exception as e:
             st.error(f"Terjadi error: {e}")
