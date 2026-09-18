@@ -441,6 +441,63 @@ def ringkasan_satu_saham(ticker: str, period: str = "6mo") -> dict:
     }
 
 
+def screening_risk_reward(
+    daftar_ticker: list,
+    period: str = "6mo",
+    sumber_level: str = "Pivot Point (harian)",
+    buffer_persen: float = 1.0,
+) -> list:
+    """
+    Hitung SL/TP/Risk-Reward Ratio untuk sekumpulan saham sekaligus (pakai
+    logika yang sama dengan Kalkulator SL/TP di tab Analisa Detail), supaya
+    bisa di-screening/diurutkan cari yang rasio-nya paling bagus.
+
+    Saham yang gagal diambil datanya, atau level Support/Resistance-nya belum
+    terdeteksi (khusus sumber Historis), dilewati diam-diam per-saham — tidak
+    menggagalkan screening buat saham lain di daftar yang sama.
+    """
+    hasil = []
+    for ticker in daftar_ticker:
+        try:
+            df = ambil_data(ticker, period=period)
+            df = hitung_indikator(df)
+            pivot = hitung_pivot_point(df)
+            last = df.iloc[-1]
+            close = last["Close"]
+
+            if sumber_level == "Pivot Point (harian)":
+                support = pivot["Support 1"]
+                resistance = pivot["Resistance 1"]
+            else:
+                raw_swing = _deteksi_level_swing(df)
+                support = raw_swing["support_level"]
+                resistance = raw_swing["resistance_level"]
+
+            if support is None or resistance is None:
+                continue
+
+            sltp = hitung_sl_tp(close, support, resistance, buffer_persen)
+
+            hasil.append({
+                "Kode": ticker.replace(".JK", ""),
+                "Close": round(close, 2),
+                "SL": sltp["SL"],
+                "TP": sltp["TP"],
+                "RSI(14)": round(last["RSI"], 2),
+                "Tren (MA20 vs MA50)": "Bullish" if last["MA20"] > last["MA50"] else "Bearish",
+                "Risk-Reward Ratio": sltp["Risk-Reward Ratio"],
+                "rr_value": sltp.get("rr_value"),  # None kalau tidak valid (dipakai buat sorting)
+                "valid": sltp["valid"],
+            })
+        except Exception:
+            continue
+
+    # Urutkan dari RR terbaik (angka lebih besar = lebih bagus); yang N/A
+    # (rr_value None) ditaruh paling akhir, bukan dianggap 0.
+    hasil.sort(key=lambda r: (r["rr_value"] is None, -(r["rr_value"] or 0)))
+    return hasil
+
+
 # ---------- UI Streamlit ----------
 
 init_db()
@@ -592,6 +649,22 @@ with tab_watchlist:
         value="BBCA, BBRI, TLKM",
         key="watchlist_input",
     )
+
+    with st.expander("⚙️ Pengaturan Screening Risk-Reward"):
+        colRR1, colRR2 = st.columns(2)
+        with colRR1:
+            sumber_level_watchlist = st.radio(
+                "Sumber level Support/Resistance",
+                ["Pivot Point (harian)", "Support/Resistance Historis (90 hari)"],
+                key="sumber_watchlist",
+            )
+        with colRR2:
+            buffer_watchlist = st.slider(
+                "Buffer (%) — antisipasi fakeout",
+                min_value=0.0, max_value=5.0, value=1.0, step=0.5,
+                key="buffer_watchlist",
+            )
+
     cek_watchlist = st.button("Cek Watchlist", type="primary")
 
     if cek_watchlist and input_watchlist.strip():
@@ -642,6 +715,55 @@ with tab_watchlist:
             )
         else:
             st.error("Tidak ada data yang berhasil diambil.")
+
+        st.divider()
+        st.subheader("🎯 Screening Risk-Reward Ratio")
+        st.caption(
+            "SL/TP dihitung pakai rumus & pengaturan yang sama dengan Kalkulator SL/TP "
+            "di tab Analisa Detail (lihat ⚙️ Pengaturan Screening di atas), diurutkan dari "
+            "Risk-Reward Ratio paling bagus. Bukan rekomendasi trading."
+        )
+
+        rr_hasil = screening_risk_reward(
+            daftar_kode, period="6mo",
+            sumber_level=sumber_level_watchlist, buffer_persen=buffer_watchlist,
+        )
+
+        if not rr_hasil:
+            st.info(
+                "Belum ada saham dengan level Support/Resistance yang bisa dihitung. "
+                "Coba sumber level lain, atau tambah saham di daftar di atas."
+            )
+        else:
+            hanya_bagus = st.checkbox(
+                "Hanya tampilkan yang rasionya ≥ 1:1 (sembunyikan yang N/A / risiko lebih besar dari potensi untung)",
+                key="filter_rr_bagus",
+            )
+
+            rr_tampil = [r for r in rr_hasil if not hanya_bagus or (r["rr_value"] is not None and r["rr_value"] >= 1)]
+
+            if not rr_tampil:
+                st.info("Tidak ada saham yang lolos filter RR ≥ 1:1 saat ini.")
+            else:
+                df_rr = pd.DataFrame(rr_tampil).drop(columns=["rr_value", "valid"])
+
+                def warnai_rr(row):
+                    asli = next(r for r in rr_tampil if r["Kode"] == row["Kode"])
+                    if not asli["valid"]:
+                        warna = "color: gray"
+                    elif asli["rr_value"] >= 2:
+                        warna = "color: green; font-weight: bold"
+                    elif asli["rr_value"] >= 1:
+                        warna = "color: orange"
+                    else:
+                        warna = "color: red"
+                    return [warna] * len(row)
+
+                styled_rr = df_rr.style.apply(warnai_rr, axis=1).format({
+                    "Close": "{:.2f}", "SL": "{:.2f}", "TP": "{:.2f}", "RSI(14)": "{:.2f}",
+                })
+                st.dataframe(styled_rr, use_container_width=True, hide_index=True)
+                st.caption("🟢 RR ≥ 1:2 (bagus) · 🟠 RR 1:1 – 1:2 (cukup) · 🔴 RR < 1:1 · ⚪ N/A (harga di luar range S/R)")
 
 # ===================== TAB 3: JURNAL TRANSAKSI =====================
 with tab_jurnal:
