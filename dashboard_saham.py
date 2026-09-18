@@ -7,6 +7,7 @@ Cara jalankan:
     python -m streamlit run dashboard_saham.py
 """
 
+import subprocess
 import sqlite3
 from datetime import date
 
@@ -20,6 +21,7 @@ import plotly.graph_objects as go
 # ---------- Database Jurnal Transaksi (SQLite) ----------
 
 DB_PATH = "jurnal_saham.db"
+BACKUP_CSV_PATH = "jurnal_saham_backup.csv"
 
 
 def init_db():
@@ -62,6 +64,63 @@ def hapus_transaksi(id_transaksi: int):
     conn.execute("DELETE FROM transaksi WHERE id = ?", (id_transaksi,))
     conn.commit()
     conn.close()
+
+
+def backup_csv_ke_git():
+    """
+    Export seluruh jurnal transaksi ke CSV lalu commit+push ke repo GitHub.
+
+    SQLite di Streamlit Community Cloud TIDAK persisten (bisa hilang saat
+    container di-redeploy/reset), jadi ini jadi lapisan pengaman supaya data
+    transaksi tidak hilang.
+
+    Butuh secret `GITHUB_TOKEN` (Personal Access Token dengan izin "repo")
+    yang diset lewat menu App settings > Secrets di Streamlit Cloud:
+
+        GITHUB_TOKEN = "ghp_xxxxxxxxxxxxxxxx"
+
+    Kalau secret belum diset, fungsi ini diam-diam skip (tidak bikin transaksi
+    gagal tersimpan / tidak bikin app error) — jadi aman dipakai di lokal juga.
+    """
+    try:
+        token = st.secrets.get("GITHUB_TOKEN")
+    except Exception:
+        token = None
+
+    if not token:
+        return False, "GITHUB_TOKEN belum diset — auto-backup dilewati."
+
+    try:
+        df = ambil_semua_transaksi()
+        df.to_csv(BACKUP_CSV_PATH, index=False)
+
+        remote_url = f"https://x-access-token:{token}@github.com/maulanavajar/dashboard-saham.git"
+
+        subprocess.run(["git", "config", "user.email", "bot@dashboard-saham.local"], check=False, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Dashboard Saham Bot"], check=False, capture_output=True)
+        subprocess.run(["git", "add", BACKUP_CSV_PATH], check=False, capture_output=True)
+
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"chore: auto-backup jurnal transaksi ({date.today()})"],
+            capture_output=True, text=True,
+        )
+        if commit.returncode != 0:
+            # Kemungkinan besar "nothing to commit" (data sama persis) — bukan error.
+            if "nothing to commit" in (commit.stdout + commit.stderr).lower():
+                return True, "Tidak ada perubahan baru untuk di-backup."
+            return False, f"Gagal commit: {commit.stderr.strip()}"
+
+        push = subprocess.run(
+            ["git", "push", remote_url, "HEAD:main"],
+            capture_output=True, text=True,
+        )
+        if push.returncode != 0:
+            return False, f"Gagal push ke GitHub: {push.stderr.strip()}"
+
+        return True, "Backup CSV berhasil di-push ke GitHub."
+    except Exception as e:
+        # Backup gagal tidak boleh bikin transaksi utama gagal tersimpan.
+        return False, f"Auto-backup gagal: {e}"
 
 
 def hitung_ringkasan_pl(df: pd.DataFrame) -> pd.DataFrame:
@@ -229,13 +288,20 @@ def hitung_sl_tp(close: float, support: float, resistance: float, buffer_persen:
     potensi_untung = tp - close
 
     if risiko <= 0 or potensi_untung <= 0:
-        # Harga sudah di luar range Support-Resistance yang wajar
+        # Harga sudah di luar range Support-Resistance yang wajar untuk dihitung.
+        # Dibedakan sebabnya biar pesannya actionable, bukan cuma "N/A".
+        if risiko <= 0:
+            alasan = "harga saat ini sudah di bawah/sama dengan level Stop Loss yang dihitung"
+        else:
+            alasan = "harga saat ini sudah di atas/sama dengan level Take Profit yang dihitung (target sudah tercapai)"
+
         return {
             "SL": round(sl, 2),
             "TP": round(tp, 2),
             "Risiko (Rp)": round(risiko, 2),
             "Potensi Untung (Rp)": round(potensi_untung, 2),
             "Risk-Reward Ratio": "N/A (harga di luar range S/R)",
+            "alasan_tidak_valid": alasan,
             "valid": False,
         }
 
@@ -256,7 +322,38 @@ def hitung_sl_tp(close: float, support: float, resistance: float, buffer_persen:
 
 @st.cache_data(ttl=3600, show_spinner=False)  # cache 1 jam, fundamental jarang berubah
 def ambil_fundamental(ticker: str) -> dict:
-    info = yf.Ticker(ticker).info
+    """
+    Ambil data fundamental dari Yahoo Finance.
+
+    `.info` sering gagal "diam-diam" (Yahoo kadang balikin dict kosong/minim
+    tanpa melempar exception, terutama kalau kena rate-limit di shared IP
+    Streamlit Cloud) — sebelumnya ini bikin semua field tampil "-" tanpa
+    penjelasan sama sekali. Sekarang kegagalan itu dikembalikan lewat key
+    "_error" supaya bisa ditampilkan ke user, bukan cuma diam.
+    """
+    default = {
+        "Nama": "-", "Sektor": "-", "PER (Trailing)": "-", "PBV": "-",
+        "EPS (Trailing)": "-", "ROE": "-", "Dividend Yield": "-", "Market Cap": "-",
+    }
+
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception as e:
+        return {**default, "_error": f"Gagal mengambil data fundamental dari Yahoo Finance: {e}"}
+
+    # Yahoo kadang balikin dict kosong/hampir kosong tanpa error saat API-nya
+    # bermasalah (bukan exception) — di situ .get() akan selalu jatuh ke "-".
+    if not info or len(info) <= 2:
+        return {
+            **default,
+            "_error": (
+                "Yahoo Finance tidak mengembalikan data fundamental untuk ticker ini "
+                "(kemungkinan rate limit sementara atau perubahan di API mereka). "
+                "Data teknikal (chart, indikator) tidak terpengaruh karena pakai endpoint "
+                "berbeda. Coba klik 'Refresh Data' beberapa saat lagi."
+            ),
+        }
+
     return {
         "Nama": info.get("longName", "-"),
         "Sektor": info.get("sector", "-"),
@@ -287,15 +384,20 @@ def buat_chart(df: pd.DataFrame, ticker: str, pivot: dict) -> go.Figure:
         fill="tonexty", fillcolor="rgba(150,150,150,0.08)"
     ))
 
+    # Catatan: level Pivot/Resistance/Support sering berdekatan nilainya, jadi
+    # kalau tiap garis dikasih annotation_text sendiri-sendiri, labelnya numpuk
+    # jadi satu blok teks yang tidak terbaca. Solusinya: garis putus-putus tanpa
+    # label per-garis (dibedakan dari warna), sementara angka detailnya sudah
+    # ditampilkan rapi sebagai teks di bawah chart (section "Pivot Point").
     for label, harga in pivot.items():
         warna = "green" if "Support" in label else "red" if "Resistance" in label else "gray"
-        fig.add_hline(y=harga, line_dash="dot", line_color=warna,
-                       annotation_text=f"{label}: {harga}")
+        fig.add_hline(y=harga, line_dash="dot", line_color=warna, line_width=1)
 
     fig.update_layout(
         title=f"Analisa Teknikal - {ticker}",
         xaxis_rangeslider_visible=False,
         height=600,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     return fig
 
@@ -376,6 +478,10 @@ with tab_detail:
             # Chart
             fig = buat_chart(df, ticker, pivot)
             st.plotly_chart(fig, use_container_width=True)
+            st.caption(
+                "Garis putus-putus: 🔴 Resistance · 🟢 Support · ⚪ Pivot — "
+                "angka lengkapnya ada di bawah (Pivot Point & Support/Resistance Historis)."
+            )
 
             col1, col2, col3 = st.columns(3)
 
@@ -407,8 +513,13 @@ with tab_detail:
 
             with col3:
                 st.markdown("**Fundamental Dasar**")
+                error_fundamental = fundamental.get("_error")
                 for k, v in fundamental.items():
+                    if k == "_error":
+                        continue
                     st.write(f"{k}: `{v}`")
+                if error_fundamental:
+                    st.warning(error_fundamental)
 
             st.divider()
             st.subheader("🎯 Kalkulator Stop Loss / Take Profit")
@@ -461,7 +572,12 @@ with tab_detail:
                     else:
                         st.error("🚫 Rasio di bawah 1:1 — potensi risiko lebih besar dari potensi untung, pertimbangkan ulang.")
                 else:
-                    st.error(f"⚠️ {hasil_sltp['Risk-Reward Ratio']} — harga saat ini sudah di luar range Support-Resistance yang wajar untuk dihitung.")
+                    st.error(
+                        f"⚠️ Risk-Reward Ratio tidak bisa dihitung — {hasil_sltp['alasan_tidak_valid']}. "
+                        f"Coba ganti sumber level ke "
+                        f"'{'Support/Resistance Historis (90 hari)' if sumber_level == 'Pivot Point (harian)' else 'Pivot Point (harian)'}' "
+                        f"di atas, atau tunggu harga kembali masuk ke range Support-Resistance."
+                    )
 
         except Exception as e:
             st.error(f"Terjadi error: {e}")
@@ -504,8 +620,20 @@ with tab_watchlist:
             def warnai_tren(val):
                 return "color: green" if val == "Bullish" else "color: red"
 
+            # Tanpa .format() eksplisit, Styler pandas menampilkan angka float
+            # dengan banyak desimal (mis. "6375.000000") walaupun nilainya
+            # sudah dibulatkan — jadi presisi tampilan diatur manual di sini.
+            format_kolom = {
+                "Close": "{:.2f}",
+                "RSI(14)": "{:.2f}",
+                "Support 1": "{:.2f}",
+                "Resistance 1": "{:.2f}",
+                "Jarak ke Support (%)": "{:.2f}%",
+                "Jarak ke Resistance (%)": "{:.2f}%",
+            }
             styled = df_hasil.style.map(warnai_sinyal, subset=["Sinyal RSI"]) \
-                                    .map(warnai_tren, subset=["Tren (MA20 vs MA50)"])
+                                    .map(warnai_tren, subset=["Tren (MA20 vs MA50)"]) \
+                                    .format(format_kolom)
 
             st.dataframe(styled, use_container_width=True, hide_index=True)
             st.caption(
@@ -543,6 +671,7 @@ with tab_jurnal:
                     harga_transaksi, int(lot_transaksi), alasan_transaksi
                 )
                 st.success(f"Transaksi {aksi} {kode_bersih} berhasil disimpan.")
+                backup_csv_ke_git()  # best-effort, tidak mengganggu kalau gagal/belum dikonfigurasi
 
     st.divider()
     st.subheader("Ringkasan Profit/Loss per Saham")
@@ -552,6 +681,23 @@ with tab_jurnal:
     if df_transaksi.empty:
         st.info("Belum ada transaksi yang dicatat.")
     else:
+        # SQLite di Streamlit Community Cloud tidak persisten (bisa reset saat
+        # container di-redeploy), jadi selalu sediakan cara backup manual —
+        # ini tidak butuh konfigurasi apa pun, beda dengan auto-backup di atas.
+        st.download_button(
+            "⬇️ Download Jurnal sebagai CSV (backup manual)",
+            data=df_transaksi.to_csv(index=False).encode("utf-8"),
+            file_name=f"jurnal_saham_{date.today()}.csv",
+            mime="text/csv",
+        )
+        try:
+            _auto_backup_aktif = bool(st.secrets.get("GITHUB_TOKEN"))
+        except Exception:
+            _auto_backup_aktif = False
+        st.caption(
+            "Auto-backup ke GitHub tiap ada transaksi: "
+            + ("✅ aktif" if _auto_backup_aktif else "⚙️ belum aktif — set secret `GITHUB_TOKEN` di App settings Streamlit Cloud kalau mau diaktifkan.")
+        )
         df_pl = hitung_ringkasan_pl(df_transaksi)
 
         def warnai_pl(val):
@@ -581,4 +727,5 @@ with tab_jurnal:
             with col_b:
                 if st.button("Hapus", key=f"hapus_{row['id']}"):
                     hapus_transaksi(row["id"])
+                    backup_csv_ke_git()  # best-effort, tidak mengganggu kalau gagal/belum dikonfigurasi
                     st.rerun()
